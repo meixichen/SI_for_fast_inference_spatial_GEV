@@ -1,0 +1,1520 @@
+---
+title: Supplementary Materials for Fast and Scalable Inference for Spatial Extreme Value Models
+author: ''
+date: '`r Sys.Date()`'
+output:
+  bookdown::pdf_document2:
+    toc: yes
+    toc_depth: 3
+    number_sections: yes
+  html_document:
+    toc: yes
+    df_print: paged
+urlcolor: blue
+linkcolor: blue
+citecolor: blue
+bibliography: references.bib
+link-citations: true
+abstract: '\noindent This document provides all code to reproduce the Figures and Tables in "Fast and Scalable Inference for Spatial Extreme Value Models" by [name withheld for double-blind review].  It also provides (i) a comparison of different Max steps for the Max-and-Smooth algorithm and (ii) a comparison of the proposed Laplace estimator to the exact Max-and-Smooth implementation of @johannesson-etal22.'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.align = "center")
+runHMC <- FALSE
+runMCMC <- FALSE
+loadMCMCrds <- FALSE  # load MCMC samples and recalculate pos means and z draws
+loadHMCrds <- FALSE # load HMC samples and recalculate pos means, z draws, KS
+runBigSim <- FALSE
+runSnow <- FALSE
+runMSJ22param <- FALSE
+pkg_cite <- function(name, url) {
+  if(missing(url)) url <- paste0("https://CRAN.R-project.org/package=", name)
+  paste0("[**", name, "**](", url, ")")
+}
+```
+
+<!-- latex macros -->
+\newcommand{\bm}[1]{\boldsymbol{#1}}
+\newcommand{\xx}{{\bm{x}}}
+
+# Preliminaries
+
+<!-- This document provides reproducible code used for generating all figures in Fast and Scalable Inference for Spatial Extreme Value Models.  -->
+
+Our models are implemented in the R/C++ package **SpatialGEV** included in the Supplementary Material as a `tar.gz` file.  **SpatialGEV** provides tool to perform approximate inference for a number of generalized extreme value (GEV) models with spatially-varying parameters modelled via a Gaussian process, which we refer to as GEV-GP models.  
+
+## GEV-GP models
+
+Let $y_{ij}$ denote observation $j$ at spatial location $i$, of which the two-dimensional spatial coordinates are given by $\xx_i$.  Then the general form of the GEV-GP models that can be fit with the package is
+\begin{equation}
+\begin{aligned}
+y_{ij} & \stackrel{\mathrm{iid}}{\sim} \operatorname{GEV}(a(\xx_i), \exp(b(\xx_i)), \exp(s(\xx_i)) \\
+u(\xx) & \sim \operatorname{GP}(\bm{c}_u(\xx)' \bm{\beta}_u(\xx), \mathcal{K}(\xx, \xx' \mid \bm{\eta}_u),
+\end{aligned}
+(\#eq:gevgp)
+\end{equation}
+where $\operatorname{GEV}(a, b_o, s_o)$ denotes a GEV distribution for which the PDF is given by
+\begin{equation}
+f(y \mid a, b_o, s_o) = \frac{1}{b_o} t(y)^{s_o + 1} \exp\{-t(y)\}, \qquad 
+t(y) = 
+\begin{cases}
+(1 + s_o \cdot \tfrac{y - a}{b_o})^{-1/s_o} & s_o \neq 0, \\
+\exp\{\tfrac{y - a}{b_o}\}, & s_o = 0,
+\end{cases}
+(\#eq:gev)
+\end{equation}
+$u \in \{a, b, s\}$ is any subset of the GEV parameters which we would like to model as spatially varying, and $\operatorname{GP}(\mu(\xx), \mathcal{K}(\xx, \xx'))$ is a Gaussian process with mean function $\mu(\xx)$ and covariance kernel $\mathcal{K}(\xx, \xx')$.  The GEV distribution has bounded support depending on the value of $(a, b_o, s_o)$: it is bounded below by $a - b_o/s_o$ when $s_o > 0$, bounded above by $a - b_o/s_o$ when $s_o < 0$, and unbounded when $s_o = 0$.  **SpatialGEV** is designed to analyze data consisting of large extreme events.  By restricting attention to $s_o = \exp(s) > 0$ it only considers GEV models which do not upper bound the data.
+
+## Setup
+
+**SpatialGEV** is expected to run on R version 4.3 or higher.  In order to install it, first we install the package dependencies (and other packages used in the code provided here):
+```{r install-deps, eval = FALSE}
+pkg_deps <- c("INLA", "rstan", "tmbstan", "TMB", "Matrix",
+              "rlang", "evd", "mvtnorm", "mclust", "SpatialExtremes",
+              "dplyr", "tidyr", "ggplot2", "ggpubr", "fields",
+              "kableExtra", "doParallel",
+              "MASS", "SparseM", "tidyverse", "data.table")
+install.packages(pkg_deps, dependencies = TRUE)
+```
+
+Now we install the **SpatialGEV** package as follows:
+<!-- Please make sure to download all package dependencies following the `README` file in the package. The package can be installed locally by executing the code below. -->
+```{r install-spatialgev, eval = FALSE}
+install.packages("SpatialGEV_1.0.0.tar.gz", repos = NULL, type = "source", 
+                 INSTALL_opts = "--install-tests")
+```
+We may test that the installation was successful by running the following code *after quitting and restarting R*:
+```{r test-spatialgev, eval = FALSE}
+testthat::test_package("SpatialGEV", reporter = "progress")
+```
+After checking that the installation was successful, we can load the package and its dependencies in order to run the remainder of the code in this document.
+```{r load-packages, warning = FALSE, message = FALSE}
+library(SpatialGEV) # Our model and inference method
+library(INLA) # For constructing Matérn SPDE approximation
+# HMC-NUTS
+library(rstan)
+library(tmbstan)
+# MCMC with TMB models
+library(TMB)
+library(Matrix)
+library(rlang)
+# Data simulation
+library(evd)
+library(mvtnorm)
+library(mclust)
+library(SpatialExtremes) 
+library(dplyr)
+library(tidyr)
+# Plotting and tables
+library(ggplot2)
+library(ggpubr)
+library(fields)
+library(kableExtra)
+# Parallelization
+library(doParallel)
+# Helper functions
+source("paper_code_helper.R")
+source("laplace_mcmc.R") # mcmc for TMB models
+```
+
+# Small-scale study on smooth surfaces {#sec:small}
+
+To run the simulation study, first simulate data from 400 locations using the following reproducible code. The simulated random effects are plotted in Figure \@ref(fig:plot-smallSim-data).
+```{r plot-smallSim-data, fig.width=11, fig.height=4, fig.cap="Simulated random effects plotted on regular lattices"}
+set.seed(123)
+small_sim <- simulate_data_small()
+par(mfrow=c(1,3))
+grid_plot(small_sim$lon, small_sim$lat,
+          small_sim$a_mat, "a")
+grid_plot(small_sim$lon, small_sim$lat,
+          small_sim$logb_mat, "b")
+grid_plot(small_sim$lon, small_sim$lat,
+          small_sim$logs_mat, "s")
+```
+
+## Laplace method via joint Normal approximation (Laplace-MQ) {#sec:lapmq}
+
+The function `spatialGEV_fit()` in the **SpatialGEV** package is used to find the mode and quadrature of the Laplace approximation to the marginal hyperparameter posterior, which is the basis of a Normal approximation to the posterior of both hyperparameters and random effects referred to as Laplace-MQ in our paper.  The function `spatialGEV_sample()` is then used to sample from this distribution via a sparse representation of its precision matrix.  In order to do this, a C++ implementation of the full log-posterior arising from the GEV-GP model \@ref(eq:gevgp) -- which we refer to as the "model template" -- is processed by the `r pkg_cite("TMB")` package [@kristensen16], which provides a highly efficient implementation of the Laplace approximation.  C++ model templates for various spatial GEV-GP models are in the `src/TMB` folder of **SpatialGEV**. The file names are
+of the format `model_params_kernel.hpp` where `params` indicates which parameter(s) of the
+GEV distribution are treated as spatially varying, and
+`kernel` indicates which kernel to use for the spatial GP covariance matrix.  Auxilliary functions used in the model templates are located in `inst/include/SpatialGEV/utils.hpp`.
+The **TMB** template for the GEV-GP model used in the paper is `model_abs_spde.hpp`, for which the C++ code is provided in Appendix \@ref(app:template).
+
+In order to fit the Laplace-MQ approximation, we first set the model priors and the initial parameters for the optimization procedure underlying the mode-quadrature calculation.  Please see `?SpatialGEV::spatialGEV_fit` for details.
+```{r smallSim-init}
+n_loc <- nrow(small_sim$locs)
+init_param <- list(
+  a = rep(60, n_loc),
+  log_b = rep(3, n_loc),
+  s = rep(-2,n_loc),
+  beta_a = 60, beta_b = 3, beta_s = -2,
+  log_sigma_a = -1, log_kappa_a = -1,
+  log_sigma_b = -1, log_kappa_b = -1,
+  log_sigma_s = -1, log_kappa_s = -1
+)
+# Weakly informative priors on beta
+beta_prior <- list(beta_a=c(0,100), beta_b=c(0,50), beta_s=c(0,20))
+```
+
+We choose the Matérn SPDE kernel for the spatial covariance matrix by setting
+`kernel="spde"` and specify that all three GEV parameters $a,b,s$ are random by 
+setting `random="abs"`. We restrict the shape parameter $s$ to be positive by 
+setting `reparam_s="positive"`. 
+```{r runLap, cache=TRUE}
+# Get mode and quadrature for Normal approximation
+start_lap_mq <- Sys.time()
+fit_lap_mq <- spatialGEV_fit(
+  data=small_sim$data, locs=small_sim$locs,
+  random = "abs",
+  init_param = init_param, 
+  reparam_s = "positive", kernel="spde",
+  beta_prior = beta_prior, silent = TRUE
+)
+# Posterior sampling from the Normal approximated posterior
+sam_lap_mq <- spatialGEV_sample(fit_lap_mq, n_draw=10000)
+time_lap_mq <- difftime(Sys.time(), start_lap_mq, units="secs")
+```
+
+Since the Matérn SPDE kernel is used, `spatialGEV_fit()` constructs a mesh on the spatial 
+domain using functions from the `r pkg_cite("R-INLA", "www.r-inla.org")` package [@lindgren-rue15], resulting in an increase number of locations in the model
+than in the original dataset. We extract the location indices corresponding to the original 
+locations using `meshidxloc` from the `spatialGEV_fit` object. Now we can obtain the posterior
+mean and standard deviation of the random effects using the Laplace method, and calculate the mean absolute
+errors of the random effect posterior means against their true values.
+```{r sampleLap, cache=TRUE}
+post_lap_mq <- spatialGEV_get_posteriors(fit_lap_mq, sam_lap_mq)
+mae_a_lap_mq <- mean(abs(small_sim$a-post_lap_mq$a_mean))
+mae_b_lap_mq <- mean(abs(small_sim$logb-post_lap_mq$logb_mean))
+mae_s_lap_mq <- mean(abs(small_sim$logs-post_lap_mq$s_mean))
+mae_z_lap_mq <- mean(abs(small_sim$z_true-post_lap_mq$z_mean))
+```
+
+
+## Exact Laplace posterior via MCMC (Laplace-MCMC) {#sec:lap-mcmc}
+
+The Normal approximation to the Laplace posterior is known to underestimate the posterior uncertainty
+of the hyperparameters, which we confirm in the paper.  However, it is possible to explore the exact Laplace joint posterior distribution via MCMC.  Specifically, one uses MCMC to explore the Laplace marginal hyperparameter posterior.  Next one combines each hyperparameter draw $\bm{\theta}$ with a conditional posterior draw of the random effects $\bm{u}$, which given the data $\bm{y}$ and $\bm{\theta}$ are multivariate normal with mean and variance being nonlinear functions of $\bm{y}$ and $\bm{\theta}$.  Fortunately though, this mean and variance are byproducts of computing the Laplace hyperparameter posterior at each value of $\bm{\theta}$, such that MCMC sampling from the exact Laplace posterior of both hyperparameters and random effects incurs little extra cost over MCMC sampling from just the Laplace marginal hyperparameter posterior.  
+
+The code below implements this MCMC procedure on parallel chains using a random walk proposal for the hyperparameters with variance matrix proportional to that of the Laplace-MQ approximation.  This MCMC method is referred to as Laplace-MCMC in our paper.
+
+**Note:** The following chunk of code takes over 20 hours to run.
+
+```{r lap-mcmc, eval=runMCMC}
+# set up number of MCMC iterations
+n_chain <- 6
+n_iter <- 45e3
+n_burnin <- 5e3
+var_scale <- .5 # scale for the MCMC proposal
+cl <- makeCluster(n_chain) # Set up parallelization
+registerDoParallel(cl)
+parallel::clusterSetRNGStream(cl, iseed = 234)
+
+system.time(
+  lap_all_chains <- foreach(i = 1:n_chain, .export = "spatialGEV_fit") %dopar% {
+    start_time <- Sys.time()
+    # step 1: construct TMB adfun object
+    # Need to create adfun in each parallel task otherwise code fails
+    lap_adf <- spatialGEV_fit(
+      data=small_sim$data, locs=small_sim$locs,
+      random = "abs",
+      init_param = init_param,
+      reparam_s = "positive", kernel="spde",
+      beta_prior = beta_prior,
+      adfun_only = TRUE, silent = TRUE
+    )$adfun
+    # step 2: fit the Laplace-MVN approximation
+    # used to construct the MCMC proposal distribution
+    lap_fit <- nlminb(start = lap_adf$par,
+                      objective = lap_adf$fn,
+                      gradient = lap_adf$g)
+    lap_fixed_pars <- get_mvn(lap_adf, select = "fixed")
+    # step 3: mcmc sampling
+    lap_prop_sim <- function(prev, obj) {
+      # random walk proposal with variance proportional to Laplace-MVN
+      x <- mvtnorm::rmvnorm(
+        n = 1,
+        mean = prev,
+        sigma = var_scale * lap_fixed_pars$var)
+      drop(x)
+    }
+    lap_samples <- laplace_mcmc(
+      obj = lap_adf,
+      n_iter = n_iter,
+      fixed_init = lap_fixed_pars$mean,
+      prop_sim = lap_prop_sim,
+      prop_lpdf = NULL,
+      print_every = 10
+    )
+    time_taken <- difftime(Sys.time(), start_time)
+    lap_samples['time'] <- time_taken
+    lap_samples$fixed <- lap_samples$fixed[-(1:n_burnin),]
+    lap_samples$random <- lap_samples$random[-(1:n_burnin),]
+    lap_samples
+})
+stopCluster(cl)
+```
+
+```{r loadLaplaceMCMC, include=FALSE, eval=loadMCMCrds}
+lap_all_chains <- readRDS("NOT_FOR_SI/lap_all_chains_40000.rds")
+```
+
+```{r process-lap-mcmc-sam, eval=loadMCMCrds}
+lapmc_chain_times <- unlist(lapply(
+  lap_all_chains, function(chain) chain$time
+))
+meshidxloc <- fit_lap_mq$meshidxloc
+
+# Get random effect posteriors from the MCMC chains
+lapmc_res_per_chain <- get_random_posteriors_mcmc(lap_all_chains, meshidxloc)
+
+# Extract posterior means of the random effects
+lapmc_mean_per_chain <- lapply(lapmc_res_per_chain,
+                               function(chain) chain$pos_means)
+lapmc_mean <- apply(simplify2array(lapmc_mean_per_chain), c(1, 2), mean)
+
+# Extract posterior samples of z10
+z_draws_lapmc <- do.call(cbind, lapply(lapmc_res_per_chain,
+                                       function(chain) chain$z_draws))
+
+# Get posterior samples of all fixed effects as a matrix
+lapmc_sam_fixed <- do.call(rbind,
+                           lapply(lap_all_chains, function(chain){chain$fixed}))
+sams_betaa_lapmc <- lapmc_sam_fixed[, "beta_a"]
+sams_betab_lapmc <- lapmc_sam_fixed[, "beta_b"]
+sams_betas_lapmc <- lapmc_sam_fixed[, "beta_s"]
+sams_siga_lapmc <- lapmc_sam_fixed[,"log_sigma_a"]
+sams_sigb_lapmc <- lapmc_sam_fixed[,"log_sigma_b"]
+sams_sigs_lapmc <- lapmc_sam_fixed[,"log_sigma_s"]
+sams_kapa_lapmc <- lapmc_sam_fixed[,"log_kappa_a"]
+sams_kapb_lapmc <- lapmc_sam_fixed[,"log_kappa_b"]
+sams_kaps_lapmc <- lapmc_sam_fixed[,"log_kappa_s"]
+rm('lap_all_chains'); rm('lapmc_res_per_chain'); rm('lapmc_mean_per_chain')
+
+save(lapmc_mean, sams_betaa_lapmc, sams_betab_lapmc, sams_betas_lapmc,
+     sams_siga_lapmc, sams_sigb_lapmc, sams_sigs_lapmc, sams_kapa_lapmc,
+     sams_kapb_lapmc, sams_kaps_lapmc,
+     file="rda_files/lapmc_results.RData")
+```
+
+```{r load-lap-mc-data, include=FALSE, eval=!loadMCMCrds}
+load("rda_files/lapmc_results.RData")
+```
+
+Calculate the mean absolute values of the random effect estimates against their true values:
+```{r lap-mq-mae}
+a_lapmc <- lapmc_mean[,1]
+logb_lapmc <- lapmc_mean[,2]
+logs_lapmc <- lapmc_mean[,3]
+z_lapmc <- lapmc_mean[,4]
+mae_a_lap_mc <- mean(abs(small_sim$a-a_lapmc))
+mae_b_lap_mc <- mean(abs(small_sim$logb-logb_lapmc))
+mae_s_lap_mc <- mean(abs(small_sim$logs-logs_lapmc))
+mae_z_lap_mc <- mean(abs(small_sim$z_true-z_lapmc))
+```
+
+## Max-and-Smooth via joint Normal approximation (Maxsmooth-MQ)
+
+Next, we use the Max-and-Smooth approach for model inference.  This method consists of approximating the GEV contribution to the posterior resulting from \@ref(eq:gevgp) by independent multivariate normals at each spatial location, with mean and variance obtained by mode-quadrature of the GEV likelihood arising from \@ref(eq:gev) based on only the observations at a given location.  This results in a so-called Normal-Normal random-effects model for which (i) the marginal hyperparameter posterior and (ii) the random-effects posterior conditioned on both hyperaparameters and data are both analytically tractable.
+
+In this section, we fit a jointly Normal approximation to the Max-and-Smooth posterior distribution, referred to as Maxsmooth-MQ, analogous to the Laplace-MQ approximation in Section \@ref(sec:lapmq).
+
+### Comparison of different Max step methods
+
+The Max step of Max-and-Smooth is the mode-quadrature calculation at each spatial location.  We consider three different methods for the Max step:
+
+- `evd`: This method computes the mode and quadrature  of the GEV likelihood using the function `evd::gevfit()` from the `r pkg_cite("evd")` package [@evd].  Note that `evd::gevfit()` considers a more general GEV model than ours, i.e., with a shape parameter $s_o$ in \@ref(eq:gev) for which our shape parameter corresponds to $s = \log(s_o)$.  For some locations this produced an estimate $\hat s_o < 0$, in which case the `evd` method could not be used for the given location under our restricted GEV model.
+
+- `j22`: Using the generalized GEV likelihood of @johannesson-etal22 described in Section 1.6 of the Supplementary Material of that paper.  This method consists of finding the mode and quadrature of a penalized GEV likelihood.  Details  are provided in Section \@ref(sec:j22).  For now, we point out that `j22` also occasionally resulted in an estimate $\hat s_o < 0$, such that it could not be used for all spatial locations.
+
+- `tmb`: Using a generalized likelihood approach designed for our restricted GEV parametrization.  In this case, the penalty corresponds to the log of a $\operatorname{Normal}(0, 100^2)$ distribution on $s$ -- a very weak penalty which simply ensures that the mode does not escape to the boundary value $s_o = 0$.  Model fitting was done with **TMB**, which uses automatic differentation to quickly perform the optimization at each spatial location using the gradient-based optimizer `stats:nlminb()`. The `tmb` method successfully computed the mode and quadrature of the Max step at each spatial location.
+
+Figures \@ref(fig:max-step-mean) and \@ref(fig:max-step-sd) display the point estimates and standard errors for each of these three Max step methods at each of the spatial locations for which they are defined.
+```{r max-step-calc, warning = FALSE, message = FALSE, cache = TRUE, fig.width=8, fig.height=9, out.width="80%"}
+set.seed(123)
+# allocate space for max-step of each method
+mle_set <- matrix(NA, n_loc, 3)
+colnames(mle_set) <- c("a", "log_b", "log_s")
+mle_set <- list(evd = mle_set, j22 = mle_set, tmb = mle_set)
+var_set <- array(NA, dim = c(3, 3, n_loc))
+var_set <- list(evd = var_set, j22 = var_set, tmb = var_set)
+start_max_step <- Sys.time()
+# loop through locations
+for(i in 1:n_loc) {
+  yi <- small_sim$data[[i]]
+  # evd method
+  max_fit <- maxsmooth_maxstep(y = yi, method = "evd")
+  mle_set$evd[i,] <- max_fit$est
+  var_set$evd[,,i] <- max_fit$var
+  # tmb method
+  max_fit <- maxsmooth_maxstep(y = yi, method = "tmb",
+                               s_prior = c(0, 100))
+  mle_set$tmb[i,] <- max_fit$est
+  var_set$tmb[,,i] <- max_fit$var
+  # j22 method
+  max_fit <- maxsmooth_maxstep(y = yi, method = "j22")
+  mle_set$j22[i,] <- max_fit$est
+  var_set$j22[,,i] <- max_fit$var
+}
+max_step_time <- difftime(Sys.time(), start_max_step)
+```
+```{r max-step-mean, warning=FALSE, message=FALSE, fig.width=8, fig.height=9, out.width="80%", fig.cap = "Comparison of point estimates for different Max step methods."}
+# mle plot
+tmb_vs_j22 <- max_step_compare(mle_set, var_set,
+                               y = "tmb", x = "j22", type = "mle")
+tmb_vs_evd <- max_step_compare(mle_set, var_set,
+                               y = "tmb", x = "evd", type = "mle")
+j22_vs_evd <- max_step_compare(mle_set, var_set,
+                               y = "j22", x = "evd", type = "mle")
+mle_plots <- ggarrange(tmb_vs_j22, tmb_vs_evd, j22_vs_evd, ncol=1, nrow=3, 
+                       common.legend = TRUE)
+mle_plots
+```
+```{r max-step-sd, warning=FALSE, message=FALSE, fig.width=8, fig.height=9, out.width="80%", , fig.cap = "Comparison of standard error estimates for different Max step methods."}
+# se plot
+tmb_vs_j22 <- max_step_compare(mle_set, var_set,
+                               y = "tmb", x = "j22", type = "se") +
+  scale_x_log10() + scale_y_log10()
+tmb_vs_evd <- max_step_compare(mle_set, var_set,
+                               y = "tmb", x = "evd", type = "se") + 
+  scale_x_log10() + scale_y_log10()
+j22_vs_evd <- max_step_compare(mle_set, var_set,
+                               y = "j22", x = "evd", type = "se") +
+  scale_x_log10() + scale_y_log10()
+se_plots <- ggarrange(tmb_vs_j22, tmb_vs_evd, j22_vs_evd, ncol=1, nrow=3,
+                      common.legend = TRUE)
+se_plots
+```
+
+The three methods give similar point estimates for all random effects at different locations. However, the standard errors obtained using `evd` are quite different from those obtained `j22` and `tmb`, especially for $a$ and $s$. The SEs for `tmb` and `j22` are similar overall, with `tmb` producing somewhat larger SEs for $b$ across all locations. `tmb` also gives larger SEs for $s$ at a several locations.
+
+In consistency with our modelling assumption of $s_o > 0$, we implement the Max-and-Smooth method with Max step estimates obtained from `tmb` method.  The `j22` method is employed in our comparison with the exact Max-and-Smooth implementation of @johannesson-etal22 in Section \@ref(sec:j22).  
+
+The Smooth step of Max-and-Smooth refers to inference for the hyperparameter and random effects under the Normal-Normal approximation.  We note that the exact marginal hyperparameter posterior for this Normal-Normal approximation can be computed very efficiently using **TMB**, because the Laplace approximation for a Normal-Normal model is in fact exact.  For this reason, we are able to use `spatialGEV_fit()` and `spatialGEV_sample()` to implement the Maxsmooth-MQ approximation in the code below.
+
+<!-- the Laplace approximation can be used to compute the e -->
+
+
+<!-- **TMB** can binstead of using the code from J22, we used the Laplace approximation to get the posterior distribution based on the max-step estimates. Importantly, the Laplace approximation is exact (up to numerical errors) in the case of a Normal-Normal model, which is the case for the Max-and-Smooth method. Another reason why we could not implement the smooth-step code from J22 is because we use different GEV parameterizations. This inherently makes the models different, hence different implementations. Specifically, we use the $(\mathrm{location}, \log(\mathrm{scale}), \log(\mathrm{shape}))$ parameterization, whereas J22 uses a multivariate link function $(\log(\mathrm{location}), \log(\mathrm{scale}/\mathrm{location}), h(\mathrm{shape}))$, where $h(\cdot)$ is a non-linear function and restricts the shape parameter to be less than 0.5 in absolute value, while we restrict the shape to be greater than 0. -->
+<!-- We will revisit the J22 parameterization later in this SI in Section \@ref(sec:j22), where we adopt the original Max-and-Smooth code for inference. -->
+
+```{r maxsmooth-mq, warning=FALSE, message=FALSE, cache=TRUE}
+start_ms_mq <- Sys.time()
+fit_ms_mq <- spatialGEV_fit(data=list(est=mle_set$tmb, 
+                                      var=var_set$tmb),
+                            locs=small_sim$locs,
+                            random="abs",
+                            method="maxsmooth",
+                            init_param=init_param,
+                            reparam_s = "positive", kernel="spde",
+                            beta_prior = beta_prior, silent = TRUE)
+sam_ms_mq <- spatialGEV_sample(fit_ms_mq, n_draw=10000)
+maxsmooth_mq_time <- difftime(Sys.time(), start_ms_mq)
+
+# MAEs of random effects
+post_ms_mq <- spatialGEV_get_posteriors(fit_ms_mq, sam_ms_mq)
+mae_a_ms_mq <- mean(abs(small_sim$a-post_ms_mq$a_mean))
+mae_b_ms_mq <- mean(abs(small_sim$logb-post_ms_mq$logb_mean))
+mae_s_ms_mq <- mean(abs(small_sim$logs-post_ms_mq$s_mean))
+mae_z_ms_mq <- mean(abs(small_sim$z_true-post_ms_mq$z_mean))
+```
+
+
+## Exact Max-and-Smooth posterior via MCMC (Maxsmooth-MCMC) {#sec:msmc}
+
+It is possible to use MCMC to explore the exact Max-and-Smooth joint posterior distribution, i.e., without the additional Normal approximation, using a procedure analoguous to what we have described for the Laplace method in Section \@ref(sec:lap-mcmc).  This is referred to as Maxsmooth-MCMC in our paper and is implemented in the code below.
+
+**Note:** The following chunk of code takes over 9 hours to run.
+```{r ms-mcmc-sam, warning=FALSE, eval=runMCMC}
+# step 0: specify MCMC #chains and #iterations
+n_chain <- 6
+n_iter <- 45e3
+n_burnin <- 5e3
+var_scale <- .5 # proposal scale
+# step 1: max step
+ms_method <- "tmb"
+ms_s_prior <- c(0, 100)
+# allocate memory
+param_names <- c("a", "log_b", "s")
+ms_data <- list(
+  est = matrix(NA, n_loc, 3,
+               dimnames = list(NULL, param_names)),
+  var = array(NA, dim = c(3, 3, n_loc),
+              dimnames = list(param_names, param_names, NULL))
+)
+# loop through data to get max-step estimates
+for(i in 1:n_loc) {
+  yi <- small_sim$data[[i]]
+  ms_fit <- maxsmooth_maxstep(y = yi,
+                              method = ms_method,
+                              s_prior = ms_s_prior)
+  ms_data$est[i,] <- ms_fit$est
+  ms_data$var[,,i] <- ms_fit$var
+}
+cl <- makeCluster(n_chain) # Set up parallelization
+registerDoParallel(cl)
+parallel::clusterSetRNGStream(cl, iseed = 234)
+system.time(
+  ms_all_chains <- foreach(i = 1:n_chain, .packages = "SpatialGEV") %dopar% {
+    start_time <- Sys.time()
+    # initialize the model in tmb
+    ms_adf <- spatialGEV_fit(data=ms_data,
+                            locs=small_sim$locs,
+                            random="abs",
+                            method="maxsmooth",
+                            init_param=init_param,
+                            reparam_s = "positive", kernel="spde",
+                            beta_prior = beta_prior, silent = TRUE)$adfun
+    # fit the Laplace-MVN approximatioun
+    ms_fit <- nlminb(start = ms_adf$par,
+                     objective = ms_adf$fn,
+                     gradient = ms_adf$g)
+    ms_fixed_pars <- get_mvn(ms_adf, select = "fixed")
+    # MCMC sampling from full posterior
+    ms_prop_sim <- function(prev, obj) {
+      x <- mvtnorm::rmvnorm(
+        n = 1,
+        mean = prev,
+        sigma = var_scale * ms_fixed_pars$var)
+      drop(x)
+    }
+    ms_samples <- laplace_mcmc(
+      obj = ms_adf,
+      n_iter = n_iter,
+      fixed_init = ms_fixed_pars$mean,
+      prop_sim = ms_prop_sim,
+      prop_lpdf = NULL,
+      print_every = 10
+    )
+    time_taken <- difftime(Sys.time(), start_time)
+    ms_samples['time'] <- time_taken
+    ms_samples$fixed <- ms_samples$fixed[-(1:n_burnin),]
+    ms_samples$random <- ms_samples$random[-(1:n_burnin),]
+    ms_samples
+})
+
+stopCluster(cl)
+```
+
+```{r loadMSMCMC, include=FALSE, eval=loadMCMCrds}
+ms_all_chains <- readRDS("NOT_FOR_SI/ms_all_chains_40000.rds")
+```
+
+Next, we extract the posterior means of the random effects and the samples of the fixed effect posteriors.
+
+**Note:** The code below takes up a lot of memory.
+```{r process-ms-mcmc-sam, eval=loadMCMCrds}
+msmc_chain_times <- unlist(lapply(ms_all_chains, function(chain)chain$time))
+meshidxloc <- fit_ms_mq$meshidxloc
+# Get posterior samples of random effects from the MCMC chains
+msmc_res_per_chain <- get_random_posteriors_mcmc(ms_all_chains, meshidxloc)
+
+# Get posterior means of the random effects
+msmc_mean_per_chain <- lapply(msmc_res_per_chain, function(chain) chain$pos_means)
+msmc_mean <- apply(simplify2array(msmc_mean_per_chain), c(1, 2), mean)
+
+# Get posterior samples of z10
+z_draws_msmc <- do.call(cbind, lapply(msmc_res_per_chain,
+                                      function(chain) chain$z_draws))
+
+# Get posterior samples of all fixed effects as a matrix
+msmc_sam_fixed <- do.call(rbind,
+                          lapply(ms_all_chains, function(chain){chain$fixed}))
+sams_betaa_msmc <- msmc_sam_fixed[, "beta_a"]
+sams_betab_msmc <- msmc_sam_fixed[, "beta_b"]
+sams_betas_msmc <- msmc_sam_fixed[, "beta_s"]
+sams_siga_msmc <- msmc_sam_fixed[,"log_sigma_a"]
+sams_sigb_msmc <- msmc_sam_fixed[,"log_sigma_b"]
+sams_sigs_msmc <- msmc_sam_fixed[,"log_sigma_s"]
+sams_kapa_msmc <- msmc_sam_fixed[,"log_kappa_a"]
+sams_kapb_msmc <- msmc_sam_fixed[,"log_kappa_b"]
+sams_kaps_msmc <- msmc_sam_fixed[,"log_kappa_s"]
+rm('ms_all_chains'); rm('msmc_res_per_chain'); rm('msmc_mean_per_chain')
+
+save(msmc_mean, sams_betaa_msmc, sams_betab_msmc, sams_betas_msmc,
+     sams_siga_msmc, sams_sigb_msmc, sams_sigs_msmc, sams_kapa_msmc,
+     sams_kapb_msmc, sams_kaps_msmc,
+     file="rda_files/msmc_results.RData")
+```
+
+```{r load-ms-mc-data, include=FALSE, eval=!loadMCMCrds}
+load("rda_files/msmc_results.RData")
+```
+
+```{r maxsmooth-mq-mae}
+# MAEs of random effects
+a_msmc <- msmc_mean[,1]
+logb_msmc <- msmc_mean[,2]
+logs_msmc <- msmc_mean[,3]
+z_msmc <- msmc_mean[,4]
+mae_a_ms_mc <- mean(abs(small_sim$a-a_msmc))
+mae_b_ms_mc <- mean(abs(small_sim$logb-logb_msmc))
+mae_s_ms_mc <- mean(abs(small_sim$logs-logs_msmc))
+mae_z_ms_mc <- mean(abs(small_sim$z_true-z_msmc))
+```
+
+## Full Bayesian inference on the joint posterior with **Stan** (HMC-NUTS)
+
+The benchmark for evaluating the speed and accuracy of the Laplace and Max-and-Smooth approximations is the exact joint posterior on the hyperparameters and random effects arising from the GEV-GP model \@ref(eq:gevgp), which we explore using MCMC via the HMC-NUTS algorithm provided by the `r pkg_cite("rstan", "http://mc-stan.org/")` package [@rstan].  We use the `r pkg_cite("tmbstan")` package [@tmbstan] to efficiently and conveniently connect the C++ implementations of the **SpatialGEV** models to the **rstan** automatic differentiation engine.
+
+First, we set initial values and priors for running HMC-NUTS with **rstan**, 
+which samples from the model described by a **TMB** template.
+```{r create-stan-adf}
+# Create a TMB ADFun object using our spatialGEV_fit() function by setting adfun_only
+# This object will be fed to tmbstan() to perform HMC sampling
+obj_s <- spatialGEV_fit(data=small_sim$data, locs=small_sim$locs, random = "abs",
+                        init_param = init_param,
+                        reparam_s = "positive", kernel="spde",
+                        beta_prior = beta_prior,
+                        adfun_only = TRUE)
+n_s <- obj_s$mesh$n
+meshidxloc <- obj_s$mesh$idx$loc
+init_param_stan <- list(a = rep(60, n_s),
+                        log_b = rep(3, n_s),
+                        s = rep(-2,n_s),
+                        beta_a = 60, beta_b = 3, beta_s = -2,
+                        log_sigma_a = -1, log_kappa_a = -1,
+                        log_sigma_b = -1, log_kappa_b = -1,
+                        log_sigma_s = -1, log_kappa_s = -1)
+```
+
+Next, we run HMC-NUTS on the model template using `tmbstan::tmbstan()`.  
+
+**Note:** This code might take a few days to run.
+```{r stan-sample-run, eval=runHMC}
+n_chains <- 6
+n_iter <- 8000
+options(mc.cores=n_chains)
+fit_hmc <- tmbstan(obj_s$adfun, chains=n_chains, iter=n_iter, 
+                   init=function(){init_param_stan}, seed=123,
+                   verbose=TRUE, silent=FALSE, refresh=10)
+```
+
+```{r loadHMCrds, include=FALSE, eval=loadHMCrds}
+fit_hmc <- readRDS("NOT_FOR_SI/fit_hmc400.rds")$fit
+```
+
+The following code computes the posterior mean and standard deviation from the HMC-NUTS samples and calculate the mean absolute errors
+of the random effect posterior means against their true values.
+```{r hmc-results-summary, eval=loadHMCrds}
+summary_hmc <- summary(fit_hmc)$summary
+# Random effects indices
+a_ind_h <- paste0("a","[",meshidxloc,"]")
+logb_ind_h <- paste0("log_b","[",meshidxloc,"]")
+logs_ind_h <- paste0("s","[",meshidxloc,"]")
+
+# Posterior mean
+a_hmc <- summary_hmc[a_ind_h, "mean"]
+logb_hmc <- summary_hmc[logb_ind_h, "mean"]
+b_hmc <- exp(logb_hmc)
+logs_hmc <- summary_hmc[logs_ind_h, "mean"]
+s_hmc <- exp(logs_hmc)
+
+# Posterior sd
+a_sd_hmc <- summary_hmc[a_ind_h, "sd"]
+logb_sd_hmc <- summary_hmc[logb_ind_h, "sd"]
+logs_sd_hmc <- summary_hmc[logs_ind_h, "sd"]
+
+# Get posterior mean of z_10
+sam_hmc <- as.matrix(fit_hmc)
+z_draws_h <- get_posterior_z10(sam_hmc, a_ind_h, logb_ind_h, logs_ind_h)
+z_hmc <- apply(z_draws_h, 1, mean)
+z_sd_hmc <- apply(z_draws_h, 1, sd)
+
+# Posterior samples for the hyperparameters
+sams_betaa_hmc <- sam_hmc[,"beta_a"]
+sams_betab_hmc <- sam_hmc[,"beta_b"]
+sams_betas_hmc <- sam_hmc[,"beta_s"]
+sams_siga_hmc <- sam_hmc[,"log_sigma_a"]
+sams_sigb_hmc <- sam_hmc[,"log_sigma_b"]
+sams_sigs_hmc <- sam_hmc[,"log_sigma_s"]
+sams_kapa_hmc <- sam_hmc[,"log_kappa_a"]
+sams_kapb_hmc <- sam_hmc[,"log_kappa_b"]
+sams_kaps_hmc <- sam_hmc[,"log_kappa_s"]
+```
+
+To obtain a similarity measure for the HMC-NUTS samples versus samples obtained using the four other estimators (Laplace-MQ, Laplace-MCMC, Maxsmooth-MQ, Maxsmooth-MCMC), we perform the following calculation:
+
+1.  At a given location $i$, we calculate the two-sample Kolmogorov-Smirnov (K-S) test statistic for $z_{10}(\boldsymbol{x}_i)$ between the HMC-NUTS samples and the corresponding samples obtained from each of the four other estimators.
+
+2.  We average the K-S statistic of all 400 locations for each of the four estimators.
+
+The larger the value of this K-S metric, the more similar the approximate posteriors for $z_{10}$ are to the true posteriors (as calculated by HMC-NUTS).
+```{r ks-stat, eval=loadHMCrds}
+# KS statistics
+ks_z_lapmq <- ks_z_lapmc <- ks_z_msmq <- ks_z_msmc <- rep(NA, nrow(z_draws_h))
+# K-S statistic between HMC samples of z10 vs Laplace samples of z10
+set.seed(123)
+for (i in 1:length(ks_z_lapmq)){
+  ks_z_lapmq[i] <- ks.test(as.vector(post_lap_mq$z_draws[i,]),
+                           z_draws_h[i,])$statistic
+}
+
+# KS statistic between HMC samples of z10 vs Laplace-MCMC samples of z10
+set.seed(123)
+for (i in 1:length(ks_z_lapmc)){
+  ks_z_lapmc[i] <- ks.test(as.vector(z_draws_lapmc[i,]), z_draws_h[i,])$statistic
+}
+
+# KS statistic between HMC samples of z10 vs Max-and-smooth-MQ samples of z10
+set.seed(123)
+for (i in 1:length(ks_z_msmq)){
+  ks_z_msmq[i] <- ks.test(as.vector(post_ms_mq$z_draws[i,]),
+                          z_draws_h[i,])$statistic
+}
+
+# KS statistic between HMC samples of z10 vs MS-MCMC samples of z10
+set.seed(123)
+for (i in 1:length(ks_z_msmc)){
+  ks_z_msmc[i] <- ks.test(as.vector(z_draws_msmc[i,]), z_draws_h[i,])$statistic
+}
+
+ks_stat_df <- data.frame(cbind(c(mean(ks_z_lapmq), sd(ks_z_lapmq)),
+                               c(mean(ks_z_lapmc), sd(ks_z_lapmc)),
+                               c(mean(ks_z_msmq), sd(ks_z_msmq)),
+                               c(mean(ks_z_msmc), sd(ks_z_msmc))
+                               ))
+colnames(ks_stat_df) <- c("Laplace-MQ", "Laplace-MCMC",
+                          "Max-Smooth-MQ", "Max-Smooth-MCMC")
+rownames(ks_stat_df) <- c("mean", "sd")
+```
+
+```{r save-hmc-results, eval=loadHMCrds, include=FALSE}
+save(a_hmc, logb_hmc, b_hmc, logs_hmc, s_hmc, z_hmc,
+     sams_betaa_hmc, sams_betab_hmc, sams_betas_hmc, 
+     sams_siga_hmc, sams_sigb_hmc, sams_sigs_hmc,
+     sams_kapa_hmc, sams_kapb_hmc,sams_kaps_hmc, ks_stat_df,
+    file="rda_files/hmc_res.RData")
+```
+
+```{r loadHMCdata, include=FALSE, eval=!loadHMCrds}
+load("rda_files/hmc_res.RData")
+```
+
+Finally, we check the mean absolute errors of the HMC-NUTS results.
+```{r hmc-mae}
+mae_a_hmc <- mean(abs(small_sim$a-a_hmc))
+mae_b_hmc <- mean(abs(small_sim$logb-logb_hmc))
+mae_s_hmc <- mean(abs(small_sim$logs-logs_hmc), na.rm=TRUE)
+mae_z_hmc <- mean(abs(small_sim$z_true-z_hmc))
+```
+
+
+## Figures and tables for the small-scale simulation study
+
+Table \@ref(tab:mae-small) summarizes the mean absolute values of parameter estimates against their true values from different methods.
+```{r mae-small}
+mae_small <- data.frame(c(mae_a_hmc, mae_a_lap_mq, mae_a_lap_mc, mae_a_ms_mq, mae_a_ms_mc),
+                        c(mae_b_hmc, mae_b_lap_mq, mae_b_lap_mc, mae_b_ms_mq, mae_b_ms_mc),
+                        c(mae_s_hmc, mae_s_lap_mq, mae_s_lap_mc, mae_s_ms_mq, mae_s_ms_mc),
+                        c(mae_z_hmc, mae_z_lap_mq, mae_z_lap_mc, mae_z_ms_mq, mae_z_ms_mc),
+                        row.names = c("Stan-HMC", "Laplace (MQ)", "Laplace (MCMC)", 
+                                      "Max-and-Smooth (MQ)",
+                                      "Max-and-Smooth (MCMC)"))
+colnames(mae_small) <- c("MAE($a$)", "MAE($b$)", "MAE($s$)", "MAE($z_{10}$)")
+make_table(mae_small, caption = "Summary of mean absolute errors.")
+```
+
+Table \@ref(tab:ks-small) summarizes the K-S statistics comparing the $z_{10}$ posterior samples from each method vs those from HMC-NUTS. The closer the K-S statistic is to zero, the more the posterior samples from the method resemble the posterior samples from the benchmark HMC-NUTS results.
+```{r ks-small}
+make_table(ks_stat_df,
+           caption = "Summary of the K-S statistic.")
+```
+
+Figure \@ref(fig:plot-point-est) displays the random effect posterior mean estimates versus the their corresponding true values.
+```{r plot-point-est, warning=FALSE, message=FALSE, fig.width=12, fig.height=14, fig.cap="True vs posterior mean of random effects and return levels for various estimators."}
+mytheme <- create_ggplot_theme(text_size=10)
+  
+# All information to plot
+rng_a <- range(c(small_sim$a, a_hmc, post_lap_mq$a_mean, post_ms_mq$a_mean,
+                 a_lapmc, a_msmc))
+rng_b <- range(c(small_sim$logb, logb_hmc, post_lap_mq$logb_mean, 
+                 post_ms_mq$logb_mean, logb_lapmc, logb_msmc))
+rng_s <- range(c(small_sim$logs, logs_hmc, post_lap_mq$s_mean, 
+                 post_ms_mq$s_mean, logs_lapmc, logs_msmc))
+rng_z <- range(c(small_sim$z_true, z_hmc, post_lap_mq$z_mean, post_ms_mq$z_mean,
+                 z_lapmc, z_msmc))
+
+true_z10_lab <- expression(paste("True ", z[10], "(x)"))
+est_z10_lab <- expression(paste("Estimated ", z[10], "(x)"))
+
+scatterp_range_list <- rep(list(rng_a, rng_b, rng_s, rng_z), 5)
+scatterp_x_list <- rep(list(small_sim$a, small_sim$logb, small_sim$logs,
+                            small_sim$z_true), 5)
+scatterp_y_list <- list(a_hmc, logb_hmc, logs_hmc, z_hmc,
+                        post_lap_mq$a_mean, post_lap_mq$logb_mean, 
+                        post_lap_mq$s_mean, post_lap_mq$z_mean,
+                        a_lapmc, logb_lapmc, logs_lapmc, z_lapmc,
+                        post_ms_mq$a_mean, post_ms_mq$logb_mean, 
+                        post_ms_mq$s_mean, post_ms_mq$z_mean,
+                        a_msmc, logb_msmc, logs_msmc, z_msmc)
+scatterp_title_labels <- paste0("(", letters[1:20], ")")
+scatterp_titles <- rep(c("HMC-NUTS", "Laplace (MQ)", "Laplace (MCMC)",
+                         "Max-and-Smooth (MQ)", "Max-and-Smooth (MCMC)"),
+                       each=4)
+scatterp_xlab_list <- rep(list("True a", "True b", "True s", true_z10_lab),
+                          5)
+scatterp_ylab_list <- rep(list("Estimated a", "Estimated b", "Estimated s", 
+                               est_z10_lab), 5)
+
+scatterplot_list <- lapply(1:20, function(i) {
+  true_vs_est_scatterplot(
+    true = scatterp_x_list[[i]],
+    est = scatterp_y_list[[i]],
+    axis_lim = scatterp_range_list[[i]], 
+    title = paste(scatterp_title_labels[i], scatterp_titles[i]),
+    x_lab = scatterp_xlab_list[[i]],
+    y_lab = scatterp_ylab_list[[i]],
+    theme = mytheme
+  )
+})
+ggarrange(plotlist=scatterplot_list, nrow=5, ncol=4)
+```
+
+Figure \@ref(fig:plot-hyper-pos) displays the posteriors of the spatial hyperparameters as density plots for the five methods considered in the paper.
+```{r plot-hyper-pos, warning=FALSE, message=FALSE, fig.width=13, fig.height=10, fig.cap="Posterior distributions of the hyperparameters."}
+# Parameter estimate uncertainty for hyperparameters
+hist_df <- data.frame(beta_a=c(sam_lap_mq$parameter_draws[,"beta_a"], 
+                               sams_betaa_lapmc, 
+                               sams_betaa_msmc, 
+                               sam_ms_mq$parameter_draws[,"beta_a"],
+                               sams_betaa_hmc),
+                      beta_b=c(sam_lap_mq$parameter_draws[,"beta_b"], 
+                               sams_betab_lapmc, 
+                               sams_betab_msmc, 
+                               sam_ms_mq$parameter_draws[,"beta_b"],
+                               sams_betab_hmc),
+                      beta_s=c(sam_lap_mq$parameter_draws[,"beta_s"], 
+                               sams_betas_lapmc, 
+                               sams_betas_msmc, 
+                               sam_ms_mq$parameter_draws[,"beta_s"],
+                               sams_betas_hmc),
+                      log_sigma_a=c(sam_lap_mq$parameter_draws[,"log_sigma_a"], 
+                                    sams_siga_lapmc, 
+                                    sams_siga_msmc, 
+                                    sam_ms_mq$parameter_draws[,"log_sigma_a"],
+                                    sams_siga_hmc),
+                      log_kappa_a=c(sam_lap_mq$parameter_draws[,"log_kappa_a"], 
+                                    sams_kapa_lapmc,
+                                    sams_kapa_msmc, 
+                                    sam_ms_mq$parameter_draws[,"log_kappa_a"],
+                                    sams_kapa_hmc),
+                      log_sigma_b=c(sam_lap_mq$parameter_draws[,"log_sigma_b"], 
+                                    sams_sigb_lapmc,
+                                    sams_sigb_msmc,
+                                    sam_ms_mq$parameter_draws[,"log_sigma_b"],
+                                    sams_sigb_hmc),
+                      log_kappa_b=c(sam_lap_mq$parameter_draws[,"log_kappa_b"], 
+                                    sams_kapb_lapmc,
+                                    sams_kapb_msmc,
+                                    sam_ms_mq$parameter_draws[,"log_kappa_b"],
+                                    sams_kapb_hmc),
+                      log_sigma_s=c(sam_lap_mq$parameter_draws[,"log_sigma_s"], 
+                                    sams_sigs_lapmc,
+                                    sams_sigs_msmc,
+                                    sam_ms_mq$parameter_draws[,"log_sigma_s"],
+                                    sams_sigs_hmc),
+                      log_kappa_s=c(sam_lap_mq$parameter_draws[,"log_kappa_s"], 
+                                    sams_kaps_lapmc,
+                                    sams_kaps_msmc,
+                                    sam_ms_mq$parameter_draws[,"log_kappa_s"],
+                                    sams_kaps_hmc),
+                      Method=c(rep("Laplace (MQ)", dim(sam_lap_mq$parameter_draws)[1]), 
+                               rep("Laplace (MCMC)", length(sams_betaa_lapmc)), 
+                               rep("Max-Smooth (MCMC)", length(sams_betaa_msmc)),
+                               rep("Max-Smooth (MQ)", dim(sam_ms_mq$parameter_draws)[1]),
+                               rep("HMC-NUTS",length(sams_betaa_hmc)))
+                      )
+
+hist_labels <- c("beta_a", "log_sigma_a", "log_kappa_a",
+                     "beta_b", "log_sigma_b", "log_kappa_b",
+                     "beta_s", "log_sigma_s", "log_kappa_s")
+hist_xlab_list <- list(expression(beta[a]), expression(log(sigma[a]^2)), 
+                       expression(log(kappa[a])),
+                       expression(beta[b]), expression(log(sigma[b]^2)), 
+                       expression(log(kappa[b])),
+                       expression(beta[s]), expression(log(sigma[s]^2)), 
+                       expression(log(kappa[s])))
+hist_title_list <- list(expression("(a) Posterior distribution for"~beta[a]),
+                    expression("(b) Posterior distribution for"~log(sigma[a]^2)),
+                    expression("(c) Posterior distribution for"~log(kappa[a])),
+                    expression("(d) Posterior distribution for"~beta[b]),
+                    expression("(e) Posterior distribution for"~log(sigma[b]^2)),
+                    expression("(f) Posterior distribution for"~log(kappa[b])),
+                    expression("(g) Posterior distribution for"~beta[s]),
+                    expression("(h) Posterior distribution for"~log(sigma[s]^2)),
+                    expression("(i) Posterior distribution for"~log(kappa[s])))
+hist_xlim_list <- list(c(0, 120), c(-2, 10), c(-6, 0),
+                       c(-5, 10), c(-2, 10), c(-6, 0),
+                       c(-4.5, 2.5), c(-4, 8), c(-6, 0))
+
+mytheme <- create_ggplot_theme(14)
+histplot_list <- lapply(1:9, function(i){
+  ggplot(hist_df, aes(x=get(hist_labels[i]), color=Method)) + 
+    geom_density(size=1.5) + xlim(hist_xlim_list[[i]]) +
+    xlab(hist_xlab_list[[i]]) + mytheme +
+    ggtitle(hist_title_list[[i]])
+})
+
+ggarrange(plotlist=histplot_list, ncol=3, nrow=3, 
+          common.legend = TRUE)
+```
+
+We check the relative differences between our Laplace posterior means and HMC-NUTS posterior means in Figure \@ref(fig:plot-pos-ratio).
+```{r plot-pos-ratio, fig.width=8, fig.height=7, out.width="90%", fig.cap="Relative difference between Laplace posterior means and HMC-NUTS posteriors means."}
+par(mfrow=c(2,2), mar=c(5, 5, 4, 6))
+grid_plot(small_sim$lon, small_sim$lat, matrix((post_lap_mq$a_mean-a_hmc)/a_hmc, 
+                                               ncol=sqrt(n_loc)), 
+          title="Rel. diff. between Laplace and HMC-NUTS for a", cex=1.1)
+grid_plot(small_sim$lon, small_sim$lat, matrix((post_lap_mq$logb_mean-logb_hmc)/logb_hmc, 
+                                               ncol=sqrt(n_loc)),
+          title="Rel. diff. between Laplace and HMC-NUTS for b", cex=1.1)
+grid_plot(small_sim$lon, small_sim$lat, matrix((post_lap_mq$s_mean-logs_hmc)/logs_hmc, 
+                                               ncol=sqrt(n_loc)),
+          title="Rel. diff. between Laplace and HMC-NUTS for s", cex=1.1)
+```
+
+Finally, we plot the difference between true and estimated $a$, $b$, $s$, and $z_{10}$ on heatmaps in Figure \@ref(fig:plot-diff-RE-map).
+```{r plot-diff-RE-map, fig.width=8.5, fig.height=8, out.width="80%", fig.cap="Estimation errors for the random effects and the return levels."}
+par(mfrow=c(2,2), mar=c(5,5,4,6))
+grid_plot(small_sim$lon, small_sim$lat, matrix(post_lap_mq$a_mean-small_sim$a, 
+                                               ncol=sqrt(n_loc)), 
+          title="Absolute error in a", cex=1.1)
+grid_plot(small_sim$lon, small_sim$lat, matrix(post_lap_mq$logb_mean-small_sim$logb, 
+                                               ncol=sqrt(n_loc)), 
+          title="Absolute error in b", cex=1.1)
+grid_plot(small_sim$lon, small_sim$lat, matrix(post_lap_mq$s_mean-small_sim$logs, 
+                                               ncol=sqrt(n_loc)), 
+          title="Absolute error in s", cex=1.1)
+grid_plot(small_sim$lon, small_sim$lat, matrix(post_lap_mq$z_mean-small_sim$z_true, 
+                                               ncol=sqrt(n_loc)),
+          title="Absolute error in z", cex=1.1)
+```
+
+# Large-scale simulation study
+
+In this section, we consider a much larger dataset that consists of 6,400 locations, compared to 400 locations in the small-scaled simulation study.
+Moreover, the spatial variation of each GEV parameter is less smooth compared to the small simulation, as shown in Figure \@ref(fig:simLarge). The Delta method is used to compute the posterior mean and standard deviation of each random effect and the return levels $z_{10}(\boldsymbol{x})$.
+
+First, simulate data on an $80 \times 80$ grid:
+```{r simLarge, fig.width=11, fig.height=4, fig.cap="Simulated random effects plotted on regular lattices"}
+set.seed(222)
+big_sim <- simulate_data_big()
+
+# Plot simulated data on maps
+par(mfrow=c(1,3))
+grid_plot(big_sim$lon, big_sim$lat, big_sim$a_mat, 
+          title="a", cex=1.1)
+grid_plot(big_sim$lon, big_sim$lat, big_sim$logb_mat, 
+          title="b", cex=1.1)
+grid_plot(big_sim$lon, big_sim$lat, big_sim$logs_mat, 
+          title="s", cex=1.1)
+```
+
+## Laplace Method via joint Normal approximation (Laplace-MQ)
+
+Due to time and memory limitations, the only posterior method which could scale up to this large simulation study was Laplace-MQ.  Even as such, we could not compute the posterior distribution for $z_{10}(\xx)$ via simulation as we did in the small-scale study, as this would require sampling from the $6400 \times 3 = 19,200$ dimensional posterior distirbution of the random effects.  Instead, a Delta-method is used to approximate the posterior distribution of $z_{10}$ using far less computation time and memory.  
+
+The Laplace-MQ method is fit using `spatialGEV_fit()` in the code below.  Initial parameters and priors for the model were the same as in the small-scale study. 
+
+**Note:** This code takes 22 hours to run and requires 90Gb of memory.
+```{r bigSim, eval=runBigSim}
+# Initial values for the parameters
+n_loc <- nrow(big_sim$locs)
+init_param <- list(
+  a = rep(60, n_loc),
+  log_b = rep(3, n_loc),
+  s = rep(-2,n_loc),
+  beta_a = 60, beta_b = 3, beta_s = -2,
+  log_sigma_a = -1, log_kappa_a = -1,
+  log_sigma_b = -1, log_kappa_b = -1,
+  log_sigma_s = -1, log_kappa_s = -1
+)
+# Weakly informative priors on beta
+beta_prior <- list(beta_a=c(0,100), beta_b=c(0,50), beta_s=c(0,20))
+
+# Model fitting
+t_start <- Sys.time()
+fit_big <- spatialGEV_fit(data=big_sim$data, locs=big_sim$locs, random = "abs",
+                          init_param = init_param, 
+                          reparam_s = "positive", kernel="spde",
+                          beta_prior = beta_prior, silent = TRUE, 
+                          return_level = TRUE, get_hessian = FALSE)
+bigsim_runtime <- difftime(Sys.time(), t_start, units="secs")
+report_big <- fit_big$report
+meshidxloc_big <- fit_big$meshidxloc
+```
+
+```{r save-bigSim-results, include=FALSE, eval=runBigSim}
+save(report_big, meshidxloc_big, file="rda_files/results-80x80.RData")
+```
+
+```{r load-bigSim-results, include=FALSE, eval=!runBigSim}
+load("rda_files/results-80x80.RData")
+```
+
+```{r calc-bigsim-est}
+a_ind_big <- meshidxloc_big
+logb_ind_big <- length(report_big$par.random)/3+meshidxloc_big
+logs_ind_big <- length(report_big$par.random)/3*2+meshidxloc_big
+a_s <- report_big$par.random[a_ind_big]
+logb_s <- report_big$par.random[logb_ind_big]
+logs_s <- report_big$par.random[logs_ind_big]
+z_s <- report_big$value
+```
+
+## Figures for the large-scale simulation study
+
+Figure \@ref(fig:plot-bigSim) (a)-(d) displays the posterior mean estimates of the random effects against their corresponding true values. Figure  \@ref(fig:plot-bigSim) (e)-(h) examines the accuracy of the posterior uncertainty of the Laplace-MQ approximation.  Without a baseline comparison to the exact posterior distribution, this is assessed by computing at each location $i$ the z-score 
+$$
+\mathcal{Z}(\gamma_i) = \frac{\hat \gamma_i - \gamma_i}{\widehat{\operatorname{sd}}(\gamma_i)},
+$$
+where $\gamma_i$ is the true value at location $i$ of the quantity $\gamma \in \{a, b, s, z_{10}\}$, $\hat \gamma_i$ is the estimate of its posterior mean, and $\widehat{\operatorname{sd}}(\gamma_i)$ is the estimate of its posterior standard deviation with Laplace-MQ.  If the posterior uncertainty is both accurate and accurately estimated, then these z-scores should be close to a 45 degree line on a QQ plot.  While there are systematic departures from this line at the lower extreme for $b$ and $s$, and the upper extreme for $z_{10}$, the QQ plots indicated that posterior uncertainty is overall well captured by the Laplace-MQ method.
+```{r plot-bigSim, warning=FALSE, fig.width=12, fig.height=6, fig.cap="(a)-(d): True vs posterior mean of random effects and return levels. (e)-(h): QQ plots of z-scores for random effects and return levels."}
+a_range <- range(c(big_sim$a, a_s))
+b_range <- range(c(big_sim$logb, logb_s))
+s_range <- range(c(big_sim$logs, logs_s))
+z_range <- range(c(big_sim$z_true, z_s))
+
+mytheme <- create_ggplot_theme(text_size=10, title_size = 12)
+
+big_a_est <- true_vs_est_scatterplot(
+  big_sim$a, a_s,
+  axis_lim = a_range,
+  title = expression("(a) Estimated vs True z-score for"~a), 
+  x_lab = "True z-score",
+  y_lab = "Estimated z-score",
+  theme = mytheme
+)
+big_b_est <- true_vs_est_scatterplot(
+  big_sim$logb, logb_s,
+  axis_lim = b_range,
+  title = expression("(b) Est. vs True z-score for"~b), 
+  x_lab = "True z-score",
+  y_lab = "Estimated z-score",
+  theme = mytheme
+)
+big_s_est <- true_vs_est_scatterplot(
+  big_sim$logs, logs_s,
+  axis_lim = s_range,
+  title = expression("(c) Est. vs True z-score for"~s), 
+  x_lab = "True z-score",
+  y_lab = "Estimated z-score",
+  theme = mytheme
+)
+big_z_est <- true_vs_est_scatterplot(
+  big_sim$z_true, z_s,
+  axis_lim = z_range,
+  title = expression("(d) Est. vs True z-score for"~z[10]), 
+  x_lab = "True z-score",
+  y_lab = "Estimated z-score",
+  theme = mytheme
+)
+
+param_sd <- summary(report_big, "random")
+a_sd <- param_sd[a_ind_big, 2]
+logb_sd <- param_sd[logb_ind_big, 2]
+logs_sd <- param_sd[logs_ind_big, 2]
+z_sd <- report_big$sd
+zscore_a <- (big_sim$a - a_s)/a_sd
+zscore_b <- (big_sim$logb - logb_s)/logb_sd
+zscore_s <- (big_sim$logs - logs_s)/logs_sd
+zscore_z <- (big_sim$z_true - z_s)/z_sd
+
+big_qq_a <- qq_plot(
+  zscore = zscore_a,
+  title = expression("(e) QQ plot for z-score of"~a),
+  x_lab = "Theoretical Quantile",
+  y_lab = "Sample Quantile",
+  theme = mytheme
+)
+big_qq_b <- qq_plot(
+  zscore = zscore_b,
+  title = expression("(f) QQ plot for z-score of"~b),
+  x_lab = "Theoretical Quantile",
+  y_lab = "Sample Quantile",
+  theme = mytheme
+)
+big_qq_s <- qq_plot(
+  zscore = zscore_s,
+  title = expression("(g) QQ plot for z-score of"~s),
+  x_lab = "Theoretical Quantile",
+  y_lab = "Sample Quantile",
+  theme = mytheme
+)
+big_qq_z <- qq_plot(
+  zscore = zscore_z,
+  title = expression("(h) QQ plot for z-score of"~z[10]),
+  x_lab = "Theoretical Quantile",
+  y_lab = "Sample Quantile",
+  theme = mytheme
+)
+ggarrange(big_a_est, big_b_est, big_s_est, big_z_est,
+          big_qq_a, big_qq_b, big_qq_s, big_qq_z,
+          ncol=4, nrow=2)
+```
+
+
+# Case study on monthly snowfall
+
+The case study analyzes the monthly total snowfall data in Canada from January 1987 to December 2021. We load the preprocessed snowfall data `CAsnow` from our package **SpatialGEV**, create a spatial mesh for SPDE approximation, and plot it on the map of Canada in Figure \@ref(fig:plot-case-data).
+```{r plot-case-data, out.width="70%", fig.cap="509 locations at which at least 10 years of data was recorded after gridding"}
+data("CA-snowdata")
+n_loc <- nrow(CAsnow$locs)
+bnd <- inla.nonconvex.hull(as.matrix(CAsnow$locs), convex = -0.025, resolution = c(49,25))
+cutoff <- 0.5
+max.edge <- 2
+mesh <- inla.mesh.2d(CAsnow$locs, boundary = bnd, 
+                     cutoff = cutoff, max.edge = max.edge)
+par(mar=c(0.5,1,0.5,1))
+plot(mesh, main="")
+points(CAsnow$locs$cell_lon, CAsnow$locs$cell_lat, pch=20, cex=0.8, col="red")
+maps::map("world", "Canada", add=TRUE)
+```
+
+In Figure \@ref(fig:plot-case-density), the probability density function and cumulative density function plots of data pooled across from all time points and locations show a heavy tail. This provides evidence for using the GEV distribution to model these observations.
+```{r plot-case-density, fig.width=9, fig.height=3, out.width="80%", fig.cap="PDF and CDF of all 509 extreme value observations pooled across locations and time."}
+snow_pdf <- ggplot(mapping=aes(x = unlist(CAsnow$Y))) + 
+  geom_histogram(aes(y = after_stat(density)),
+                 colour = 1, fill = "grey",
+                 bins=50) +
+  geom_density()+
+  xlab("Maximum yearly records of monthly total snowfall (in cm)")
+
+snow_cdf <- ggplot(mapping=aes(x = unlist(CAsnow$Y))) + 
+  stat_ecdf() +
+  xlab("Maximum yearly records of monthly total snowfall (in cm)")
+ggarrange(snow_pdf, snow_cdf, ncol=2)
+```
+
+## Model fitting
+
+We fit two different models to the data: `fit_a` which assumes only the location parameter $a$ is random, and `fit` which is the one we eventually adopted in the paper and which assumes $a$ and $b$ are random but $s$ is a fixed effect.
+```{r snowmodel, eval=runSnow}
+# Model a: Only a random
+fit_a <- spatialGEV_fit(data=CAsnow$Y, locs=CAsnow$locs, random="a",
+                        init_param = list(a=rep(40, n_loc),
+                                          log_b=3,
+                                          s=-2,
+                                          beta_a=30,
+                                          log_sigma_a=1, log_kappa_a=-3),
+                      reparam_s="positive",
+                      beta_prior=list(beta_a=c(0,100)),
+                      kernel="spde",
+                      s_prior=c(-5,3),
+                      silent=FALSE,
+                      boundary=bnd, cutoff=cutoff, max.edge=max.edge)
+sam_a <- spatialGEV_sample(fit_a, n_draw=5000, observation=TRUE)
+# Posterior predictive quantities
+y_rep_90_a <- apply(sam_a$y_draws, 2, quantile, probs=0.9) # 90% posterior pred
+y_rep_50_a <- apply(sam_a$y_draws, 2, quantile, probs=0.5) # 50% posterior pred
+
+# Model ab: Only a and b random
+fit <- spatialGEV_fit(data=CAsnow$Y, locs=CAsnow$locs, random="ab",
+                      init_param = list(a=rep(40, n_loc),
+                                        log_b=rep(3, n_loc),
+                                        s=-2,
+                                        beta_a=30, beta_b=3,
+                                        log_sigma_a=1, log_kappa_a=-3,
+                                        log_sigma_b=-2, log_kappa_b=-3),
+                      beta_prior=list(beta_a=c(0,100),beta_b=c(0,100)),
+                      reparam_s="positive",
+                      kernel="spde",
+                      s_prior=c(-5,5),
+                      silent=FALSE,
+                      boundary=bnd, cutoff = cutoff, max.edge = max.edge)
+sam <- spatialGEV_sample(fit, n_draw=5000, observation=TRUE)
+# Posterior predictive quantities
+y_rep_90 <- apply(sam$y_draws, 2, quantile, probs=0.9) # 90% posterior pred
+y_rep_50 <- apply(sam$y_draws, 2, quantile, probs=0.5) # 50$ posterior pred
+```
+
+```{r save-caseStudy-model-results, eval=runSnow, include=FALSE}
+save(y_rep_50_a, y_rep_90_a, file="rda_files/case-study-model-a-pred.Rdata")
+save(y_rep_50, y_rep_90, file="rda_files/case-study-model-ab-pred.Rdata")
+```
+
+```{r load-caseStudy-model-results, include=FALSE, eval=!runSnow}
+load("rda_files/case-study-model-a-pred.Rdata")
+load("rda_files/case-study-model-ab-pred.Rdata")
+```
+
+## Model selection
+
+Here we show the posterior prediction check procedure described in the paper chooses model $M_{ab}$ over model $M_a$. We first find the true 90% and 50% quantile at each location of the data.
+```{r pred-check-true}
+y_true_90 <- sapply(CAsnow$Y, quantile, probs=0.9)
+y_true_50 <- sapply(CAsnow$Y, quantile, probs=0.5)
+```
+
+Next, samples from the posterior predictive distribution for each model are already obtained by calling `spatialGEV_sample()`. By setting `observation=TRUE` the function samples from the posterior predictive distribution in addition to the parameter posteriors. Figure \@ref(fig:pred-check-ab) displays the posterior predictive median and upper 10% quantile from model $M_{ab}$ plotted versus the corresponding observed values at each location.
+```{r pred-check-ab, fig.width=8, fig.height=4, out.width="80%", fig.cap="Posterior predicted versus empirical test statistics for model $M_{ab}$."}
+# Plot theme
+mytheme <- create_ggplot_theme(text_size=10)
+pred_ab_50 <- pospred_vs_obs_plot(y_true_50, y_rep_50, "median")+mytheme
+pred_ab_90 <- pospred_vs_obs_plot(y_true_90, y_rep_90, "upper 10% quantile")+mytheme
+ggarrange(pred_ab_50, pred_ab_90)
+```
+
+Similarly, we check the posterior predictive performance of model $M_a$. Figure \@ref(fig:pred-check-a) shows that model $M_a$ performs worse than model $M_{ab}$.
+```{r pred-check-a, fig.width=8, fig.height=4, out.width="80%", fig.cap="Posterior predicted versus empirical test statistics for model $M_{a}$."}
+pred_a_50 <- pospred_vs_obs_plot(y_true_50, y_rep_50_a, "median")+mytheme
+pred_a_90 <- pospred_vs_obs_plot(y_true_90, y_rep_90_a, "upper 10% quantile")+mytheme
+ggarrange(pred_a_50, pred_a_90, ncol=2)
+```
+
+## Parameter inference
+
+We obtain the parameter estimates from the posterior samples of $a$, $b$ 
+and $s$, and the posterior samples of $z_{10}$ by applying the appropriate 
+transformation of $a$, $b$ and $s$.
+```{r caseStudy-results-summary, eval=runSnow}
+case_pos_estimates <- spatialGEV_get_posteriors(fit, sam)
+a_mean <- case_pos_estimates$a_mean
+logb_mean <- case_pos_estimates$logb_mean
+logs_mean<- case_pos_estimates$s_mean
+return10 <- case_pos_estimates$z_mean
+a_sd <- case_pos_estimates$a_sd
+logb_sd <- case_pos_estimates$logb_sd
+logs_sd <- case_pos_estimates$s_sd
+return10sd <- case_pos_estimates$z_sd
+```
+
+```{r save_model_ab, eval=runSnow, include=FALSE}
+save(a_mean, a_sd, logb_mean, logb_sd, return10, return10sd,
+     file="rda_files/case-study-model-ab-estimates.Rdata")
+```
+
+```{r load_model_ab, include=FALSE, eval=!runSnow}
+load("rda_files/case-study-model-ab-estimates.Rdata")
+```
+
+Finally, the posterior means and standard deviations of $a(\boldsymbol{x})$, $b(\boldsymbol{x})$, and $z_{10}(\boldsymbol{x})$ are plotted in Figures \@ref(fig:plot-case-est-a), \@ref(fig:plot-case-est-b), and \@ref(fig:plot-case-est-z), where locations with high posterior uncertainty are marked.
+```{r plot-case-est-a, fig.width=10, fig.height=6, out.width="80%", fig.cap="Posterior means and SDs for $a(\\boldsymbol{x})$."}
+par(mfrow=c(1,2))
+map_plot(a_mean, zlim=range(a_mean), 
+         lon=CAsnow$locs$cell_lon, lat=CAsnow$locs$cell_lat, title="Mean of a")
+map_plot(a_sd, zlim=range(a_sd), 
+         lon=CAsnow$locs$cell_lon, lat=CAsnow$locs$cell_lat, title="SD of a")
+```
+
+```{r plot-case-est-b, fig.width=10, fig.height=6, out.width="80%", fig.cap="Posterior means and SDs for $b(\\boldsymbol{x})$."}
+par(mfrow=c(1,2))
+map_plot(logb_mean, zlim=range(logb_mean), 
+         lon=CAsnow$locs$cell_lon, lat=CAsnow$locs$cell_lat, title="Mean of b")
+map_plot(logb_sd, zlim=range(logb_sd), 
+         lon=CAsnow$locs$cell_lon, lat=CAsnow$locs$cell_lat, title="SD of b")
+```
+
+```{r plot-case-est-z, fig.width=10, fig.height=6, out.width="80%", fig.cap="Posterior means and SDs for $z_{10}(\\boldsymbol{x})$."}
+# Mark the three example locations in the paper
+loc1 <- which(CAsnow$locs[,1]==-80.5 & CAsnow$locs[,2]==43.5)
+loc2 <- which(CAsnow$locs[,1]==-117.5 & CAsnow$locs[,2]==51.5)
+loc3 <- which(CAsnow$locs[,1]==-130.5 & CAsnow$locs[,2]==56.5)
+par(mfrow=c(1,2))
+map_plot(return10, zlim=range(return10), 
+         lon=CAsnow$locs$cell_lon, lat=CAsnow$locs$cell_lat, title="Mean of z10")
+points(CAsnow$locs[loc1,], cex=2, col="red", lwd=2.5)
+points(CAsnow$locs[loc2,], cex=2, col="red", lwd=2.5, pch=2)
+points(CAsnow$locs[loc3,], cex=2, col="red", lwd=2.5, pch=5)
+map_plot(return10sd, zlim=range(return10sd), 
+         lon=CAsnow$locs$cell_lon, lat=CAsnow$locs$cell_lat, title="SD of z10")
+points(CAsnow$locs[loc1,], cex=2, col="red", lwd=2.5)
+points(CAsnow$locs[loc2,], cex=2, col="red", lwd=2.5, pch=2)
+points(CAsnow$locs[loc3,], cex=2, col="red", lwd=2.5, pch=5)
+```
+
+# Comparison with Max-and-Smooth implementation of @johannesson-etal22 {#sec:j22}
+
+The Max-and-Smooth implementation of @johannesson-etal22 -- henceforth referred to as J22 -- is an MCMC algorithm on the Max-and-Smooth approximate posterior similar to the Maxsmooth-MCMC method we describe in Section \@ref(sec:msmc).  The main difference between the J22 implementation and ours is that J22 adopts a different parametrization $(\psi, \tau, \phi)$ for the GP models:
+\begin{equation}
+\begin{aligned}
+  \psi & = \log(a), & \tau & = \log(b_o / s_o), & \phi & = h(s_o),
+\end{aligned}
+(\#eq:j22param)
+\end{equation}
+where
+$$
+h(s_o) = a_{\phi} + b_{\phi} \log\left(-\log\{1-(s+\tfrac 1 2)^{c_{\phi}}\}\right),
+$$
+with $a_{\phi}=0.062376$, $b_{\phi}=0.39563$ and $c_\phi=0.8$. 
+<!-- In order to use the same implementation of Max-and-Smooth in @johannesson-etal22 (J22), -->
+<!-- we adopt their parameterization: -->
+<!-- \begin{equation} -->
+<!--     (\psi, \tau, \phi) = f(\mathrm{location}, \mathrm{scale}, \mathrm{shape})  -->
+<!--     = (\log(\mathrm{location}), \log(\mathrm{scale}/\mathrm{shape}), h(\mathrm{shape})) -->
+<!-- \end{equation} -->
+<!-- where -->
+<!-- \begin{equation} -->
+<!--     h(s) = a_{\phi} + b_{\phi}\log[-\log\{1-(s+1/2)^{c_{\phi}}\}], -->
+<!-- \end{equation} -->
+<!-- with $a_{\phi}=0.062376$, $b_{\phi}=0.39563$ and $c_\phi=0.8$. -->
+We refer to @johannesson-etal22 for how this parameterization is justified and constructed, 
+but note that \@ref(eq:j22param) restricts the shape parameter of the GEV model to $\vert s_o \vert < 0.5$. 
+<!-- For the remainder of this section, we use the term "Max-and-Smooth" to refer to the J22 implementation, for which code for both the Max and Smooth steps are provided in the Supplementary Marial of @johannesson-etal22.   -->
+We compare estimation results of J22 to our Laplace-MQ approximation using the J22 parametrization \@ref(eq:j22param). 
+The **TMB** template for this model can be found in the **SpatialGEV** package in `src/TMB/model_ptp_spde.hpp`.
+
+We now regenerate the small-scale simulation study data to be fit by the Laplace-MQ and J22 methods.
+```{r supp-sim-data}
+set.seed(123)
+small_sim <- simulate_data_small()
+```
+
+## Laplace method with J22 parametrization (Laplace-MQ)
+
+Model fitting using the Laplace-MQ method with the J22 parametrization \@ref(eq:j22param) is exactly as described in Section \@ref(sec:lapmq), except that the GPs are now on $\psi(\boldsymbol{x})$, $\tau(\boldsymbol{x})$ and $\phi(\boldsymbol{x})$. However, the small-scale simulation data contained 43 out of 400 locations with $s_o > 0.5$, which are out of the range of the J22 parametrization \@ref(eq:j22param).  These locations are thus excluded from the analyses below.  We adopt the same hyperparameter priors used in J22, i.e., Normal priors on $(\boldsymbol{\beta}_{\psi}, \boldsymbol{\beta}_{\tau}, \boldsymbol{\beta}_{\phi})$ and Penalized Complexity priors on the Matérn range and standard deviation.
+
+<!-- We apply both Max-and-Smooth and the Laplace method on the same small-scale simulated  -->
+<!-- data in Section \@ref(sec:small) with $(a(\boldsymbol{x}_i), b(\boldsymbol{x}_i), s(\boldsymbol{x}_i), \ i=1,\ldots,357)$ transformed into $(\psi(\boldsymbol{x}_i), \tau(\boldsymbol{x}_i), \phi(\boldsymbol{x}_i), \ i=1,\ldots,357)$.  -->
+<!-- 43 out of the 400 locations were removed in this study as their true $s_o$ are greater than $0.5$. We adopt the same hyperparameter priors used in @johannesson-etal22, i.e., Normal priors on $(\boldsymbol{\beta}_{\psi}, \boldsymbol{\beta}_{\tau}, \boldsymbol{\beta}_{\phi})$ and Penalized Complexity priors on the Matérn range and standard deviation. -->
+<!-- We drew $1000$ posterior samples for both methods and found Laplace 5 times faster than Max-and-Smooth as implemented in @johannesson-etal22. -->
+
+```{r ms-data-transform, cache=TRUE}
+set.seed(123)
+true_theta <- paper2j22_transform(small_sim$a, small_sim$logb, exp(small_sim$logs))
+psi <- true_theta$psi
+tau <- true_theta$tau
+phi <- true_theta$phi
+
+# remove shape > 0.5 not supported by the parameterization in J22
+rm_loc_ind <- which(is.na(phi)) 
+psi <- psi[-rm_loc_ind]
+tau <- tau[-rm_loc_ind]
+phi <- phi[-rm_loc_ind]
+
+data_na_rm <- small_sim$data[-rm_loc_ind]
+n_obs <- sapply(data_na_rm, length)
+loc_ind <- rep(1:length(data_na_rm), times=n_obs)
+```
+
+```{r ms-multilink, cache=TRUE}
+lap_start_t <- Sys.time() # begin timer
+# Create mesh
+coords <- as.matrix(small_sim$locs[-rm_loc_ind, ])
+mesh <- inla.mesh.2d(
+  loc=coords,
+  max.edge = 2)
+n_s <- mesh$n
+X_psi <- X_tau <- X_kappa <- matrix(rep(1, n_s), nrow=n_s, ncol=1)
+meshidxloc <- as.integer(mesh$idx$loc)
+
+data <- list(model="model_ptp_spde",
+             y=unlist(data_na_rm),
+             loc_ind=meshidxloc[loc_ind]-1,
+             design_mat_psi=X_psi,
+             design_mat_tau=X_tau,
+             design_mat_phi=X_kappa,
+             nu=1,
+             spde=(INLA::inla.spde2.matern(mesh)$param.inla)[c("M0", "M1", "M2")],
+             beta_prior=as.integer(1),
+             beta_psi_prior=c(0,10000),    # Normal prior on beta coeff for psi
+             beta_tau_prior=c(0,10000),
+             beta_phi_prior=c(0,10000),
+             psi_pc_prior=as.integer(1),
+             range_psi_prior=c(0.5, 0.95), # PC prior on range for the GP on psi
+             sigma_psi_prior=c(1, 0.01),   # PC prior on sd for the GP on psi
+             tau_pc_prior=as.integer(1),
+             range_tau_prior=c(0.5, 0.95), 
+             sigma_tau_prior=c(1, 0.01),
+             phi_pc_prior=as.integer(1),
+             range_phi_prior=c(0.5, 0.95),  
+             sigma_phi_prior=c(1, 0.01)
+            )
+parameters <- list(
+  psi = rep(4.2, n_s),
+  tau = rep(-2, n_s),
+  phi = rep(0.2, n_s),
+  beta_psi = 4.2, beta_tau = -3, beta_phi = 0.2,
+  log_sigma_psi = -2, log_kappa_psi = -1,
+  log_sigma_tau = -2, log_kappa_tau = -1,
+  log_sigma_phi = -2, log_kappa_phi = -1)
+random <- c("psi","tau","phi")
+map <- NULL
+
+adfun <- TMB::MakeADFun(data = data,
+                        parameters = parameters,
+                        random = random,
+                        map = map,
+                        DLL = "SpatialGEV_TMBExports",
+                        silent = TRUE)
+fit <- nlminb(adfun$par, adfun$fn, adfun$gr)
+report <- TMB::sdreport(adfun, getJointPrecision=TRUE)
+
+########### Posterior sampling  ###############
+n_draw <- 1000
+hyperparam_labels <- c("beta_psi","beta_tau","beta_phi","log_sigma_psi",
+                       "log_kappa_psi", "log_sigma_tau","log_kappa_tau",
+                       "log_sigma_phi","log_kappa_phi")
+lap_multilink_res <- get_posterior_from_tmb(report, meshidxloc, n_draw,
+                                            "psi", "tau", "phi",
+                                            hyperparam_labels=hyperparam_labels)
+psi_est <- lap_multilink_res$u1 # extract posterior mean
+tau_est <- lap_multilink_res$u2
+phi_est <- lap_multilink_res$u3
+z_est <- lap_multilink_res$z_s
+
+lap_total_time <- difftime(Sys.time(), lap_start_t) # End timer
+cat("Time taken (in sec) by the Laplace-MQ method is", "\n", 
+    lap_total_time, "\n")
+```
+
+The mean absolute errors from the Laplace method estimation are calculated.
+```{r lap-multilink-mae}
+mae_psi_lap <- mean(abs(psi-psi_est))
+mae_tau_lap <- mean(abs(tau-tau_est))
+mae_phi_lap <- mean(abs(phi-phi_est))
+mae_z_lap <- mean(abs(small_sim$z_true[-rm_loc_ind]-z_est))
+```
+
+## Max-and-Smooth using J22 code
+
+We now use the J22 implementation to fit the simulation data.  This implementation is provided in the Supplementary Material of @johannesson-etal22 in the form of two R scripts:
+
+1. `fitModelNoTrend.R`: the main script for model fitting and MCMC sampling.
+
+2. `helperFun.R`: provides various helper functions used in the main script.
+  
+In order to use the J22 implementation here, we must make a few minimal adjustments: 
+
+i. We modified the inputs to `INLA::inla.mesh.2d()` so that the spatial mesh used in Max-and-Smooth is the exactly the one used in our paper.
+
+ii. We removed all covariates used the original J22 code since our simulation studies do not include any covariates.
+
+```{r ms-orig-code-samp, message=FALSE, eval=runMSJ22param}
+set.seed(123)
+# Prepare the data frame in a format used by Max-and-Smooth code
+n_loc_rm <- length(data_na_rm)
+data_max <- data.frame(Station=rep(1:length(data_na_rm), 
+                                   times=sapply(data_na_rm, length)),
+                       data=unlist(data_na_rm))
+stations <- unique(data_max$Station)
+locs_ms <- small_sim$locs[-rm_loc_ind,]
+colnames(locs_ms) <- c("long","lat")
+locs_ms$Station <- 1:n_loc_rm
+n_st <- n_loc_rm
+
+# Source the J22 R scripts.
+#
+# **Note:** if INLA fails with notes about `inla.core.safe`, 
+# it is most likely due to an incompatible version of the
+# **Matrix** package.
+source("j22_Rscripts/helperFun.R")
+source("j22_Rscripts/fitModelNoTrend.R")
+```
+
+```{r save-ms-orig-results, eval=runMSJ22param, include=FALSE}
+save(N_x_loops, rm_loc_ind, ms_total_time, psi_sam, tau_sam, phi_sam, 
+     file="rda_files/ms_new_param_fit.RData")
+```
+
+```{r load-ms-orig-results, include=FALSE, eval=!runMSJ22param}
+load("rda_files/ms_new_param_fit.RData")
+```
+
+```{r print-ms-orig-time}
+cat("Time taken by the original Max-Smooth code is", "\n",
+    ms_total_time, "minutes \n")
+```
+
+```{r CalcMSMultiLinkEstimates}
+# fitModelNoTrend.R provides the random effect samples stored in
+# `psi_sam`, `tau_sam` and `phi_sam`. Transform these parameters to get posterior
+# samples of the 10% return level z_10.
+z_sam <- sapply(1:N_x_loops,
+	 function(i){
+	   psi <- psi_sam[,i]
+	   tau <- tau_sam[,i]
+	   phi <- phi_sam[,i]
+	   mapply(qgev, p=0.1, loc=exp(psi), scale=exp(psi+tau),
+		        shape=phi2s(phi), lower.tail=FALSE)
+	 })
+
+# Posterior mean of the parameters of interest
+psi_ms_est <- rev(apply(psi_sam, 1, mean))
+tau_ms_est <- rev(apply(tau_sam, 1, mean))
+phi_ms_est <- rev(apply(phi_sam, 1, mean))
+z_ms_est <- rev(apply(z_sam, 1, mean))
+```
+
+Table \@ref(tab:mae-ms-orig) summarizes the mean absolute errors (MAEs) for the J22 implementation along with those of Laplace-MQ.
+```{r mae-ms-orig}
+mae_psi_ms <- mean(abs(psi-psi_ms_est))
+mae_tau_ms <- mean(abs(tau-tau_ms_est))
+mae_phi_ms <- mean(abs(phi-phi_ms_est))
+mae_z_ms <- mean(abs(small_sim$z_true[-rm_loc_ind]-z_ms_est))
+mae_j22 <- data.frame(c(mae_psi_ms, mae_psi_lap), c(mae_tau_ms, mae_tau_lap),
+                      c(mae_phi_ms, mae_phi_lap), c(mae_z_ms, mae_z_lap),
+                      row.names = c("Max-and-Smooth J22", "Laplace-MQ"))
+colnames(mae_j22) <- c("MAE($\\psi$)", "MAE($\\tau$)", "MAE($\\phi$)", "MAE($z_{10}$)")
+make_table(mae_j22, 
+           caption = "Summary of mean absolute errors.")
+```
+
+Figure \@ref(fig:plot-msOrig-point-est) displays the true versus estimated posterior means of the parameters of 
+interest using both methods.  The performance of J22 on this simulated data is much worse than using our original parametrization in Section \@ref(sec:small).  Specifically, the transformed shape parameter $\phi$ is severely underestimated by J22, which translates to a much higher MAE in Table \@ref(tab:mae-ms-orig) on the return level $z_{10}$ than we found under the original parametrization in Table \@ref(tab:mae-small).  The Laplace-MQ approximation also has trouble estimating $\phi$ but to a lesser extent.  This does not seem to have much of an impact on the MAE for $z_{10}$, which is about the same in Table \@ref(tab:mae-ms-orig) as it is in Table \@ref(tab:mae-small).  A potential reason for the J22 parametrization to produce worse results in our simulation study is that the it has multiple locations with values of $s_o$ close to the J22 boundary value of $0.5$, which both the J22 method and the Laplace-MQ method under this parametrization tend to underestimate.
+```{r plot-msOrig-point-est, warning=FALSE, message=FALSE, fig.width=10, fig.height=5, fig.cap="True vs posterior mean of random effects and return levels for Laplace-MQ and J22 Max-and-Smooth estimators."}
+mytheme <- create_ggplot_theme()
+true_z10_lab <- expression(paste("True ", z[10], "(x)"))
+est_z10_lab <- expression(paste("Estimated ", z[10], "(x)"))
+psi_range <- range(c(psi, psi_ms_est, psi_est))
+tau_range <- range(c(tau, tau_ms_est, tau_est))
+phi_range <- range(c(phi, phi_ms_est, phi_est))
+z_range <- range(c(small_sim$z_true[-rm_loc_ind], z_ms_est, z_est))
+
+psi_plot_lap <- true_vs_est_scatterplot(psi, psi_est, psi_range, "Laplace", 
+                                        expression("True"~psi), 
+                                        expression("Estimated"~psi),
+                                        mytheme)
+tau_plot_lap <- true_vs_est_scatterplot(tau, tau_est, tau_range, "Laplace", 
+                                        expression("True"~tau), 
+                                        expression("Estimated"~tau),
+                                        mytheme)
+phi_plot_lap <- true_vs_est_scatterplot(phi, phi_est, phi_range, "Laplace", 
+                                        expression("True"~phi), 
+                                        expression("Estimated"~phi),
+                                        mytheme)
+z_plot_lap <- true_vs_est_scatterplot(small_sim$z_true[-rm_loc_ind],
+                                      z_est, z_range, 
+                                      "Laplace", true_z10_lab, 
+                                      est_z10_lab,
+                                      mytheme)
+psi_plot_ms <- true_vs_est_scatterplot(psi, psi_ms_est, psi_range,
+                                       "Max-and-Smooth", 
+                                       expression("True"~psi), 
+                                       expression("Estimated"~psi),
+                                       mytheme)
+tau_plot_ms <- true_vs_est_scatterplot(tau, tau_ms_est, tau_range,
+                                       "Max-and-Smooth", 
+                                       expression("True"~tau), 
+                                       expression("Estimated"~tau),
+                                       mytheme)
+phi_plot_ms <- true_vs_est_scatterplot(phi, phi_ms_est, phi_range,
+                                       "Max-and-Smooth", 
+                                       expression("True"~phi), 
+                                       expression("Estimated"~phi),
+                                       mytheme)
+z_plot_ms <- true_vs_est_scatterplot(small_sim$z_true[-rm_loc_ind], z_ms_est,
+                                     z_range, 
+                                     "Max-and-Smooth", true_z10_lab, 
+                                     est_z10_lab,
+                                     mytheme)
+ggarrange(psi_plot_ms, tau_plot_ms, phi_plot_ms, z_plot_ms,
+          psi_plot_lap, tau_plot_lap, phi_plot_lap, z_plot_lap,
+          nrow=2, ncol=4)
+```
+
+\pagebreak
+
+# References
+
+<div id="refs"></div>
+
+# (APPENDIX) Appendix {-}
+
+# C++ model template file for GEV-GP with SPDE kernel {#app:template}
+
+```{r displaycpp, echo = FALSE, results = "asis"}
+#model_file <- system.file("src", "TMB", "model_abs_spde.hpp", package = "SpatialGEV")
+model_file <- "model_abs_spde.hpp"
+cat("```cpp", readLines(model_file) , "```", sep = "\n")
+```
