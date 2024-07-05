@@ -1,7 +1,9 @@
 ---
-title: Supplementary Materials for Fast and Scalable Inference for Spatial Extreme Value Models
-author: ''
-date: '`r Sys.Date()`'
+title: 'Supplementary Materials for "Fast and Scalable Inference for Spatial Extreme Value Models"'
+author: |
+  | Meixi Chen, Reza Ramezan, Martin Lysy
+  | University of Waterloo
+date: May 22, 2024
 output:
   bookdown::pdf_document2:
     toc: yes
@@ -15,7 +17,7 @@ linkcolor: blue
 citecolor: blue
 bibliography: references.bib
 link-citations: true
-abstract: '\noindent This document provides all code to reproduce the Figures and Tables in "Fast and Scalable Inference for Spatial Extreme Value Models" by [name withheld for double-blind review].  It also provides (i) a comparison of different Max steps for the Max-and-Smooth algorithm and (ii) a comparison of the proposed Laplace estimator to the exact Max-and-Smooth implementation of @johannesson-etal22.'
+abstract: '\noindent This document provides all code to reproduce the Figures and Tables in "Fast and Scalable Inference for Spatial Extreme Value Models" by @chen-etal24.  It also provides (i) a comparison of different Max steps for the Max-and-Smooth algorithm and (ii) a comparison of the proposed Laplace estimator to the exact Max-and-Smooth implementation of @johannesson-etal22.'
 ---
 
 ```{r setup, include=FALSE}
@@ -41,7 +43,7 @@ pkg_cite <- function(name, url) {
 
 <!-- This document provides reproducible code used for generating all figures in Fast and Scalable Inference for Spatial Extreme Value Models.  -->
 
-Our models are implemented in the R/C++ package **SpatialGEV** included in the Supplementary Material as a `tar.gz` file.  **SpatialGEV** provides tool to perform approximate inference for a number of generalized extreme value (GEV) models with spatially-varying parameters modelled via a Gaussian process, which we refer to as GEV-GP models.  
+Our models are implemented in the R/C++ package **SpatialGEV** included in the Supplementary Material as `SpatialGEV_1.0.1.tar.gz`.  **SpatialGEV** provides tool to perform approximate inference for a number of generalized extreme value (GEV) models with spatially-varying parameters modelled via a Gaussian process, which we refer to as GEV-GP models.  
 
 ## GEV-GP models
 
@@ -77,10 +79,10 @@ pkg_deps <- c("INLA", "rstan", "tmbstan", "TMB", "Matrix",
 install.packages(pkg_deps, dependencies = TRUE)
 ```
 
-Now we install the **SpatialGEV** package as follows:
+Now we install the **SpatialGEV** package by running the following from the R working directory containing `SpatialGEV_1.0.1.tar.gz`:
 <!-- Please make sure to download all package dependencies following the `README` file in the package. The package can be installed locally by executing the code below. -->
 ```{r install-spatialgev, eval = FALSE}
-install.packages("SpatialGEV_1.0.0.tar.gz", repos = NULL, type = "source", 
+install.packages("SpatialGEV_1.0.1.tar.gz", repos = NULL, type = "source", 
                  INSTALL_opts = "--install-tests")
 ```
 We may test that the installation was successful by running the following code *after quitting and restarting R*:
@@ -980,33 +982,33 @@ mytheme <- create_ggplot_theme(text_size=10, title_size = 12)
 big_a_est <- true_vs_est_scatterplot(
   big_sim$a, a_s,
   axis_lim = a_range,
-  title = expression("(a) Estimated vs True z-score for"~a), 
-  x_lab = "True z-score",
-  y_lab = "Estimated z-score",
+  title = expression("(a) Est. vs True"~a), 
+  x_lab = expression("True"~a),
+  y_lab = expression("Estimated"~a),
   theme = mytheme
 )
 big_b_est <- true_vs_est_scatterplot(
   big_sim$logb, logb_s,
   axis_lim = b_range,
-  title = expression("(b) Est. vs True z-score for"~b), 
-  x_lab = "True z-score",
-  y_lab = "Estimated z-score",
+  title = expression("(b) Est. vs True"~b), 
+  x_lab = expression("True"~b),
+  y_lab = expression("Estimated"~b),
   theme = mytheme
 )
 big_s_est <- true_vs_est_scatterplot(
   big_sim$logs, logs_s,
   axis_lim = s_range,
-  title = expression("(c) Est. vs True z-score for"~s), 
-  x_lab = "True z-score",
-  y_lab = "Estimated z-score",
+  title = expression("(c) Est. vs True"~s), 
+  x_lab = expression("True"~s),
+  y_lab = expression("Estimated"~s),
   theme = mytheme
 )
 big_z_est <- true_vs_est_scatterplot(
   big_sim$z_true, z_s,
   axis_lim = z_range,
-  title = expression("(d) Est. vs True z-score for"~z[10]), 
-  x_lab = "True z-score",
-  y_lab = "Estimated z-score",
+  title = expression("(d) Est. vs True"~z[10]), 
+  x_lab = expression("True"~z[10]),
+  y_lab = expression("Estimated"~z[10]),
   theme = mytheme
 )
 
@@ -1505,7 +1507,7 @@ ggarrange(psi_plot_ms, tau_plot_ms, phi_plot_ms, z_plot_ms,
 
 \pagebreak
 
-# References
+# References {-}
 
 <div id="refs"></div>
 
